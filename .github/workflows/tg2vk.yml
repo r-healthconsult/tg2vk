@@ -1,0 +1,61 @@
+name: tg2vk
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # каждые 30 минут
+  workflow_dispatch:
+    inputs:
+      check:
+        description: "Только проверить настройки, ничего не публикуя"
+        type: boolean
+        default: false
+
+concurrency:
+  group: tg2vk
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # нужно последнему шагу, чтобы делать пустой коммит
+
+jobs:
+  repost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Список уже опубликованного
+        uses: actions/cache/restore@v6
+        with:
+          path: state.json
+          key: tg2vk-state-${{ github.run_id }}
+          restore-keys: tg2vk-state-
+
+      - name: Репост
+        run: python3 tg2vk.py ${{ inputs.check && '--check' || '--once' }}
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          VK_GROUP_TOKEN: ${{ secrets.VK_GROUP_TOKEN }}
+          VK_USER_TOKEN: ${{ secrets.VK_USER_TOKEN }}
+          TG_CHANNEL: ipico_news
+          VK_GROUP_ID: ipico
+          # FOOTER: "Наш Telegram: https://t.me/ipico_news"
+
+      - name: Сохранить список опубликованного
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: state.json
+          key: tg2vk-state-${{ github.run_id }}
+
+      # В публичном репозитории GitHub отключает расписание после 60 дней без коммитов.
+      - name: Не дать отключить расписание
+        if: always() && github.event_name == 'schedule'
+        run: |
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$age" -gt $(( 50 * 86400 )) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Поддержание расписания"
+            git push origin HEAD
+          fi
