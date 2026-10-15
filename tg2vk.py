@@ -9,6 +9,10 @@ tg2vk: переносит новые посты Telegram-канала на ст�
 
 Настройки берутся из переменных окружения или из файла .env рядом со скриптом
 (образец в .env.example). Сторонние библиотеки не нужны, хватает Python 3.8+.
+
+Старые посты бот через Telegram получить не может. Чтобы перенести их разово,
+положите рядом со скриптом backfill.json (см. README): бот прочитает их
+с публичной страницы канала t.me/s/<канал> при следующем запуске.
 """
 
 import argparse
@@ -25,6 +29,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 
 log = logging.getLogger("tg2vk")
@@ -32,6 +38,7 @@ log = logging.getLogger("tg2vk")
 HTTP_TIMEOUT = 60       # секунд на обычный запрос
 LONG_POLL = 25          # столько секунд Telegram держит запрос, ожидая новых постов
 ALBUM_WAIT = 5          # пауза, чтобы альбом успел прийти целиком
+BACKFILL_PAUSE = 3      # пауза между старыми постами, чтобы ВК не счёл это флудом
 MAX_ATTACHMENTS = 10    # больше ВК к одной записи не прикрепит
 MEDIA_LINK_TEXT = "Фото и видео к посту: {link}"
 OTHER_MEDIA = ("video", "animation", "document", "audio", "voice", "video_note",
@@ -302,6 +309,128 @@ def extract(msgs):
     return text.strip(), photos, other, post_link(msgs[0])
 
 
+# ------------------------------------------ Старые посты со страницы t.me ----
+
+TME_MEDIA = ("tgme_widget_message_photo_wrap", "tgme_widget_message_video_player",
+             "tgme_widget_message_document_wrap", "tgme_widget_message_poll",
+             "tgme_widget_message_roundvideo_player", "tgme_widget_message_voice_player",
+             "tgme_widget_message_location_wrap")
+TME_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; tg2vk/1.0)"}
+
+
+def _plain_url(url):
+    return re.sub(r"^(https?://)?(www\.)?", "", url.strip(), flags=re.I).rstrip("/").lower()
+
+
+def render_link(anchor, href):
+    """Ссылка со страницы t.me текстом, так же как tg_to_plain делает для постов из бота."""
+    core = anchor.rstrip()
+    tail = anchor[len(core):]
+    href = (href or "").strip()
+    if (not href or href.startswith(("?", "#", "tg:", "mailto:", "tel:"))
+            or core.strip().startswith(("@", "#")) or _plain_url(core) == _plain_url(href)):
+        return anchor
+    if not core.strip():
+        return href + tail
+    return "{} ({}){}".format(core, href, tail)
+
+
+class TmePageParser(HTMLParser):
+    """Разбирает страницу t.me/s/<канал>: номер поста -> {"text": ..., "media": ...}."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.posts = {}
+        self._post = None
+        self._depth = 0        # вложенность div внутри текущего поста
+        self._text_depth = 0   # вложенность div внутри текста поста
+        self._stack = []       # буферы: текст поста, затем открытые ссылки [текст, href]
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = (attrs.get("class") or "").split()
+        if self._post is None:
+            num = (attrs.get("data-post") or "").rpartition("/")[2]
+            if tag == "div" and "tgme_widget_message" in classes and num.isdigit():
+                self._post = {"id": int(num), "text": None, "media": False}
+                self._depth = 1
+            return
+        if tag == "div":
+            self._depth += 1
+            if self._text_depth:
+                self._text_depth += 1
+        if any(c in TME_MEDIA for c in classes):
+            self._post["media"] = True
+        if self._text_depth:
+            if tag == "br":
+                self._write("\n")
+            elif tag in ("blockquote", "pre"):
+                self._newline()
+            elif tag == "a":
+                self._stack.append(["", attrs.get("href")])
+        elif tag == "div" and "tgme_widget_message_text" in classes and self._post["text"] is None:
+            self._text_depth = 1
+            self._stack = [["", None]]
+
+    def handle_endtag(self, tag):
+        if self._post is None:
+            return
+        if self._text_depth:
+            if tag == "a" and len(self._stack) > 1:
+                self._close_link()
+            elif tag in ("blockquote", "pre"):
+                self._newline()
+        if tag != "div":
+            return
+        if self._text_depth:
+            self._text_depth -= 1
+            if not self._text_depth:
+                while len(self._stack) > 1:
+                    self._close_link()
+                self._post["text"] = self._stack[0][0].strip()
+                self._stack = []
+        self._depth -= 1
+        if not self._depth:
+            post, self._post = self._post, None
+            self.posts[post["id"]] = {"text": post["text"] or "", "media": post["media"]}
+
+    def handle_data(self, data):
+        if self._text_depth:
+            self._write(data)
+
+    def _write(self, s):
+        self._stack[-1][0] += s
+
+    def _newline(self):
+        if self._stack[-1][0] and not self._stack[-1][0].endswith("\n"):
+            self._write("\n")
+
+    def _close_link(self):
+        anchor, href = self._stack.pop()
+        self._write(render_link(anchor, href))
+
+
+def fetch_old_posts(http_client, username, wanted, base="https://t.me"):
+    """Посты с публичной страницы канала, листая её назад. Возвращает {номер: пост}."""
+    found, before = {}, max(wanted) + 1
+    for _ in range(20):
+        url = "{}/s/{}?before={}".format(base.rstrip("/"), username, before)
+        status, body = http_client.request("GET", url, None, TME_HEADERS)
+        if status != 200:
+            raise NetworkError("страница канала ответила {}".format(status))
+        parser = TmePageParser()
+        parser.feed(body.decode("utf-8", "replace"))
+        parser.close()
+        if not parser.posts:
+            break
+        found.update(parser.posts)
+        oldest = min(parser.posts)
+        if oldest <= min(wanted) or oldest >= before:
+            break
+        before = oldest
+    return {n: found[n] for n in wanted if n in found}
+
+
 # ----------------------------------------------------------- Состояние ----
 
 class State:
@@ -414,6 +543,20 @@ class Reposter:
                  link or key, self.group_id, post_id)
         return True
 
+    def publish_old(self, key, post, link):
+        """Старый пост со страницы канала: текст и, если были медиа, ссылка на оригинал."""
+        use_link = post["media"] and self.cfg.media_fallback != "none"
+        if not post["text"] and not use_link:
+            log.info("Старый пост %s без текста, пропускаю", link)
+            self.state.mark(key, 0)
+            return
+        message = post["text"]
+        if self.cfg.footer:
+            message = "{}\n\n{}".format(message, self.cfg.footer) if message else self.cfg.footer
+        post_id = self._post(message, [], link if use_link else None)
+        self.state.mark(key, post_id)
+        log.info("Опубликовано: %s -> https://vk.com/wall-%s_%s", link, self.group_id, post_id)
+
     def _post(self, message, attachments, link):
         """Пробует варианты: ссылка вложением, ссылка в тексте, без ссылки."""
         variants = []
@@ -492,8 +635,82 @@ def drain(reposter, tg, timeout):
         tg.get_updates(batch[-1]["update_id"] + 1, 0)
 
 
-def run_once(reposter, tg):
+def read_backfill(path, now=None):
+    """Номера старых постов из backfill.json, если файл есть и срок не истёк."""
     try:
+        spec = json.loads(Path(path).read_text(encoding="utf-8"))
+        posts = sorted({int(n) for n in spec.get("posts", [])})
+        until = spec.get("until")
+        until = datetime.fromisoformat(until) if until else None
+    except FileNotFoundError:
+        return []
+    except (ValueError, TypeError, OSError, AttributeError) as e:
+        log.error("Файл %s не прочитан (%s), старые посты не переношу", path, e)
+        return []
+    if until is not None:
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        if (now or datetime.now(timezone.utc)) > until:
+            return []
+    return posts
+
+
+def run_backfill(reposter, tg, path):
+    """Разовый перенос старых постов, по порядку номеров.
+
+    True, если всё перенесено или переносить нечего. False, если перенос надо
+    повторить в следующий раз: тогда и новые посты ждут, чтобы не нарушить порядок.
+    """
+    posts = read_backfill(path)
+    if not posts:
+        return True
+    ch = reposter.cfg.tg_channel
+    try:
+        chat = tg.call("getChat", {"chat_id": ch if re.fullmatch(r"-?\d+", ch) else "@" + ch})
+    except TelegramError as e:
+        if e.code == "network":
+            raise RetryLater(str(e))
+        log.error("Старые посты не перенесены: %s", e)
+        return True
+    todo = [n for n in posts if "{}:{}".format(chat["id"], n) not in reposter.state.posted]
+    if not todo:
+        return True
+    if not chat.get("username"):
+        log.error("Старые посты можно перенести только из публичного канала")
+        return True
+    log.info("Переношу старые посты: %s", ", ".join(str(n) for n in todo))
+    try:
+        found = fetch_old_posts(tg.http, chat["username"], todo, reposter.cfg.tme_base)
+    except NetworkError as e:
+        raise RetryLater("страница канала: {}".format(e))
+    for i, n in enumerate(todo):
+        key = "{}:{}".format(chat["id"], n)
+        link = "https://t.me/{}/{}".format(chat["username"], n)
+        if n not in found:
+            log.warning("Пост %s не найден на странице канала, пропускаю", link)
+            reposter.state.mark(key, 0)
+            continue
+        if i:
+            time.sleep(reposter.cfg.backfill_pause)
+        try:
+            reposter.publish_old(key, found[n], link)
+        except VkError as e:
+            log.error("Старый пост %s не опубликован: %s", link, e)
+            hint = explain(e)
+            if hint:
+                log.error(hint)
+            if e.code == "network" or e.code in VK.NO_ACCESS or e.code in VK.TRANSIENT | {9, 14}:
+                return False
+            reposter.state.mark(key, 0)
+    return True
+
+
+def run_once(reposter, tg, backfill_path=None):
+    try:
+        if backfill_path and not run_backfill(reposter, tg, backfill_path):
+            log.error("Перенесены не все старые посты. Новые подождут следующего запуска, "
+                      "чтобы не нарушить порядок.")
+            return 1
         failed = drain(reposter, tg, 0)
     except RetryLater as e:
         log.error("Нет связи (%s). Посты дождутся следующего запуска.", e)
@@ -507,10 +724,16 @@ def run_once(reposter, tg):
     return 0
 
 
-def run_forever(reposter, tg):
+def run_forever(reposter, tg, backfill_path=None):
     log.info("Жду новых постов. Остановить: Ctrl+C")
+    backfill_done = not backfill_path
     while True:
         try:
+            if not backfill_done:
+                backfill_done = run_backfill(reposter, tg, backfill_path)
+                if not backfill_done:
+                    time.sleep(60)
+                    continue
             drain(reposter, tg, LONG_POLL)
         except RetryLater as e:
             log.warning("Нет связи (%s), повтор через минуту", e)
@@ -666,6 +889,9 @@ class Config:
         self.state_file = get("STATE_FILE", "state.json")
         self.tg_api = get("TG_API_BASE", "https://api.telegram.org")
         self.vk_api = get("VK_API_BASE", "https://api.vk.com/method")
+        self.tme_base = get("TME_BASE", "https://t.me")
+        self.backfill_file = get("BACKFILL_FILE", str(Path(__file__).resolve().with_name("backfill.json")))
+        self.backfill_pause = float(get("BACKFILL_PAUSE", str(BACKFILL_PAUSE)))
 
     def missing(self):
         required = (("TG_BOT_TOKEN", self.tg_token), ("TG_CHANNEL", self.tg_channel),
@@ -717,8 +943,8 @@ def main(argv=None):
     try:
         reposter.setup()
         if args.once:
-            return run_once(reposter, tg)
-        run_forever(reposter, tg)
+            return run_once(reposter, tg, cfg.backfill_file)
+        run_forever(reposter, tg, cfg.backfill_file)
         return 0
     except (TelegramError, VkError) as e:
         log.error("%s", e)
